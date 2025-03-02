@@ -205,6 +205,17 @@
           (is (= 1 (count (core/list-pods))))
           (is (not (mock/mock-pod-exists? {:id "pod123"}))))))))
 
+(deftest test-cmd-user
+  (with-mock-api
+    (fn []
+      (testing "Retrieving user information"
+        (let [result (core/cmd-user {:opts {} :args []})]
+          (is (= "user123" (:id result)))
+          (is (= "user@example.com" (:email result)))
+          (is (= 120.50 (:clientBalance result)))
+          (is (= 2 (count (:teams result))))
+          (is (= 1 (count (:ownedTeams result)))))))))
+
 ;;; =========================================================================
 ;;; Run Tests
 ;;; =========================================================================

@@ -83,7 +83,8 @@
                 :container-disk-size 10
                 :volume-size 20
                 :image "runpod/pytorch:latest"
-                :timeout 30}}))
+                :timeout 30
+                :team-id nil}}))
 
 ;; Saves the configuration to the config file
 (defn save-config
@@ -205,7 +206,7 @@
 
    Returns:
      Map: Information about the created pod including ID"
-  [{:keys [gpu-type gpu-count image container-disk-size volume-size]
+  [{:keys [gpu-type gpu-count image container-disk-size volume-size team-id]
     :or {gpu-type "NVIDIA A4000"
          gpu-count 1
          image "runpod/pytorch:latest"
@@ -215,7 +216,8 @@
   (println "Creating pod with:"
            "GPU:" gpu-type
            "Count:" gpu-count
-           "Image:" image)
+           "Image:" image
+           (when team-id (str "Team ID: " team-id)))
 
   (let [create-pod-mutation "
         mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
@@ -229,16 +231,17 @@
           }
         }
         "
-        variables {:input {:gpuTypeId gpu-type
-                           :gpuCount (if (string? gpu-count)
-                                       (Integer/parseInt gpu-count)
-                                       gpu-count)
-                           :containerDiskInGb container-disk-size
-                           :volumeInGb volume-size
-                           :imageName image
-                           :dockerArgs ""
-                           :ports "22/tcp,8888/http"
-                           :volumeMountPath "/workspace"}}
+        variables {:input (cond-> {:gpuTypeId gpu-type
+                                   :gpuCount (if (string? gpu-count)
+                                               (Integer/parseInt gpu-count)
+                                               gpu-count)
+                                   :containerDiskInGb container-disk-size
+                                   :volumeInGb volume-size
+                                   :imageName image
+                                   :dockerArgs ""
+                                   :ports "22/tcp,8888/http"
+                                   :volumeMountPath "/workspace"}
+                            team-id (assoc :teamId team-id))}
         response (graphql-request create-pod-mutation variables)
         pod (get-in response [:data :podFindAndDeployOnDemand])]
 
@@ -410,6 +413,51 @@
        :username "root"
        :public-ip (:isIpPublic ssh-port)})))
 
+;; Retrieves user information including team membership details
+(defn get-user-info
+  "Retrieves information about the current user, including team memberships.
+
+   Args:
+   None
+
+   Returns:
+   Map: User information including teams, email, credits, etc."
+  []
+  (let [query "
+    query Myself {
+      myself {
+        id
+        email
+        clientBalance
+        spendLimit
+        currentSpendPerHr
+        teams {
+          id
+          name
+          owner {
+            email
+          }
+          membership {
+            scopes
+          }
+        }
+        ownedTeams {
+          id
+          name
+          members {
+            id
+            member {
+              email
+            }
+            scopes
+          }
+        }
+      }
+    }
+  "
+        response (graphql-request query {})]
+    (get-in response [:data :myself])))
+
 ;;; =========================================================================
 ;;; Pod Management & Tracking
 ;;; =========================================================================
@@ -498,6 +546,37 @@
     (when (some? (get-pod pod-id))
       (println "\nTimeout reached. Automatically terminating pod:" pod-id)
       (terminate-pod pod-id))))
+
+;; Starts a stopped pod
+(defn start-pod
+  "Starts a previously stopped pod.
+
+   Args:
+     pod-id (String): The ID of the pod to start
+
+   Returns:
+     Map: Information about the started pod"
+  [pod-id]
+  (println "Starting pod:" pod-id)
+  (let [mutation "
+        mutation ResumePod($input: PodResumeInput!) {
+          podResume(input: $input) {
+            id
+            desiredStatus
+            gpuCount
+          }
+        }
+        "
+        variables {:input {:podId pod-id}}
+        response (graphql-request mutation variables)]
+    (let [pod (get-in response [:data :podResume])]
+      (if pod
+        (do
+          (println "Pod started successfully. New status:" (:desiredStatus pod))
+          pod)
+        (do
+          (println "Error starting pod:" response)
+          nil)))))
 
 ;;; =========================================================================
 ;;; SSH and Remote Execution
@@ -649,7 +728,8 @@
           image (:image config)
           timeout (or (:timeout config) 30)
           container-disk-size (:container-disk-size config)
-          volume-size (:volume-size config)]
+          volume-size (:volume-size config)
+          team-id (:team-id config)]
 
       (try
         ;; Create the pod
@@ -657,7 +737,8 @@
                                :gpu-count gpu-count
                                :image image
                                :container-disk-size container-disk-size
-                               :volume-size volume-size})
+                               :volume-size volume-size
+                               :team-id team-id})
               pod-id (:id pod)]
 
           ;; Set up auto-termination
@@ -724,7 +805,8 @@
           image (:image config)
           timeout (or (:timeout config) 30)
           container-disk-size (:container-disk-size config)
-          volume-size (:volume-size config)]
+          volume-size (:volume-size config)
+          team-id (:team-id config)]
 
       (try
         ;; Create the pod
@@ -732,7 +814,8 @@
                                :gpu-count gpu-count
                                :image image
                                :container-disk-size container-disk-size
-                               :volume-size volume-size})
+                               :volume-size volume-size
+                               :team-id team-id})
               pod-id (:id pod)]
 
           ;; Set up auto-termination
@@ -783,7 +866,8 @@
         gpu-count (:gpu-count config)
         image (:image config)
         container-disk-size (:container-disk-size config)
-        volume-size (:volume-size config)]
+        volume-size (:volume-size config)
+        team-id (:team-id config)]
 
     (try
       ;; Create the pod
@@ -791,7 +875,8 @@
                              :gpu-count gpu-count
                              :image image
                              :container-disk-size container-disk-size
-                             :volume-size volume-size})
+                             :volume-size volume-size
+                             :team-id team-id})
             pod-id (:id pod)]
 
         ;; Wait for pod to be ready
@@ -994,12 +1079,19 @@
       (update-config :api-key (:api-key opts)))
 
     ;; Save preset
-    (and (:save-preset opts) (seq args))
-    (let [preset-name (first args)
+    (:save-preset opts)
+    (let [preset-name (first args) ; Get the name from the first argument
           preset-config (select-keys opts [:gpu-type :gpu-count :image
-                                           :container-disk-size :volume-size :timeout])]
-      (println "Saving preset:" preset-name)
-      (save-preset preset-name preset-config))
+                                           :container-disk-size :volume-size :timeout
+                                           :team-id])]
+      (if (and preset-name (not (str/starts-with? preset-name "--")))
+        (do
+          (println "Saving preset:" preset-name)
+          (save-preset preset-name preset-config))
+        (do
+          (println "Error: No valid preset name provided")
+          (println "Usage: podpilot config --save-preset <preset-name> [options]")
+          nil)))
 
     ;; List presets
     (:list-presets opts)
@@ -1053,6 +1145,120 @@
         "from" (scp-from-pod pod-id remote-path local-path)
         (println "Error: Invalid direction (use --direction to/from)")))))
 
+;; Implements the user command
+(defn cmd-user
+  "Implements the 'user' command to display user information.
+
+   Args:
+   opts (Map): Command options
+   args (Vector): Command arguments (unused)
+
+   Returns:
+   Map: User information"
+  [{:keys [opts _args]}]
+  (let [user-info (get-user-info)]
+    (if user-info
+      (do
+        ;; Print basic user information
+        (println "\n=== User Information ===")
+        (println (format "ID:             %s" (:id user-info)))
+        (println (format "Email:          %s" (:email user-info)))
+
+        ;; Fix: Convert clientBalance to Double before formatting
+        (println (format "Balance:        $%.2f"
+                         (double (or (:clientBalance user-info) 0))))
+
+        ;; Fix: Convert spendLimit to Double and use %.2f instead of %d
+        (println (format "Spend Limit:    $%.2f"
+                         (double (or (:spendLimit user-info) 0))))
+
+        ;; Fix: Convert currentSpendPerHr to Double before formatting
+        (println (format "Current Rate:   $%.2f/hr"
+                         (double (or (:currentSpendPerHr user-info) 0))))
+
+        ;; Print teams the user is a member of
+        (when (seq (:teams user-info))
+          (println "\n=== Team Memberships ===")
+          (doseq [team (:teams user-info)]
+            (let [scopes (get-in team [:membership :scopes])
+                  role (if (map? scopes)
+                         (get scopes "role" "member")
+                         "member")]
+              (println (format "Team: %s (ID: %s)" (:name team) (:id team)))
+              (println (format "  Owner: %s" (get-in team [:owner :email])))
+              (println (format "  Role: %s" role)))))
+
+        ;; Print teams owned by the user
+        (when (seq (:ownedTeams user-info))
+          (println "\n=== Teams You Own ===")
+          (doseq [team (:ownedTeams user-info)]
+            (println (format "Team: %s (ID: %s)" (:name team) (:id team)))
+            (when (seq (:members team))
+              (println "  Members:")
+              (doseq [membership (:members team)]
+                (let [scopes (:scopes membership)
+                      role (if (map? scopes)
+                             (get scopes "role" "member")
+                             "member")]
+                  (println (format "    %s (Role: %s)"
+                                   (get-in membership [:member :email])
+                                   role)))))))
+
+        ;; Return the user info for potential further processing
+        user-info)
+      (do
+        (println "Error: Failed to retrieve user information")
+        nil))))
+
+;; Implements the start command
+(defn cmd-start
+  "Implements the 'start' command to start a stopped pod.
+
+   Args:
+     opts (Map): Command options
+     args (Vector): Command arguments (pod ID)
+
+   Returns:
+     Map: Information about the started pod"
+  [{:keys [_opts args]}]
+  (if (empty? args)
+    (println "Error: No pod ID specified")
+    (let [pod-id (first args)
+          result (start-pod pod-id)]
+      (if result
+        (do
+          (println "Pod is starting. It may take a moment to become ready.")
+          (println "Use 'podpilot list' to check its status.")
+          result)
+        (do
+          (println "Failed to start pod" pod-id)
+          nil)))))
+
+;; Implements the stop command
+(defn cmd-stop
+  "Implements the 'stop' command to stop a running pod without terminating it.
+
+   Args:
+     opts (Map): Command options
+     args (Vector): Command arguments (pod ID)
+
+   Returns:
+     Map: Information about the stopped pod"
+  [{:keys [_opts args]}]
+  (if (empty? args)
+    (println "Error: No pod ID specified")
+    (let [pod-id (first args)
+          result (stop-pod pod-id)]
+      (if result
+        (do
+          (println "Pod stopped successfully.")
+          (println "The pod still exists and can be restarted with 'podpilot start'.")
+          (println "Note: You'll still be charged for storage while the pod is stopped.")
+          result)
+        (do
+          (println "Failed to stop pod" pod-id)
+          nil)))))
+
 ;;; =========================================================================
 ;;; Help and CLI Setup
 ;;; =========================================================================
@@ -1076,9 +1282,12 @@
    (println "  shell      Start an interactive shell on a pod")
    (println "  list       List all active pods")
    (println "  catalog    Show available GPU types with pricing")
+   (println "  start      Start a stopped pod")
+   (println "  stop       Stop a running pod (without terminating)")
    (println "  kill       Terminate a pod")
    (println "  config     Manage configuration")
    (println "  transfer   Transfer files to/from a pod")
+   (println "  user       Display user information and team memberships")
    (println "  help       Show this help or help for a specific command")
    (println)
    (println "Run 'podpilot help <command>' for specific command help"))
@@ -1095,6 +1304,7 @@
        (println "  --image IMAGE             Docker image (default: runpod/pytorch:latest)")
        (println "  --timeout MINUTES         Auto-terminate after minutes (default: 30)")
        (println "  --preset NAME             Use a saved configuration preset")
+       (println "  --team-id ID              Team ID to use for pod creation")
        (println "  --container-disk-size GB  Container disk size in GB (default: 10)")
        (println "  --volume-size GB          Volume size in GB (default: 20)"))
 
@@ -1108,6 +1318,7 @@
        (println "  --image IMAGE             Docker image (default: runpod/pytorch:latest)")
        (println "  --timeout MINUTES         Auto-terminate after minutes (default: 30)")
        (println "  --preset NAME             Use a saved configuration preset")
+       (println "  --team-id ID              Team ID to use for pod creation")
        (println "  --container-disk-size GB  Container disk size in GB (default: 10)")
        (println "  --volume-size GB          Volume size in GB (default: 20)"))
 
@@ -1120,6 +1331,7 @@
        (println "  --gpu-count COUNT         Number of GPUs (default: 1)")
        (println "  --image IMAGE             Docker image (default: runpod/pytorch:latest)")
        (println "  --preset NAME             Use a saved configuration preset")
+       (println "  --team-id ID              Team ID to use for pod creation")
        (println "  --container-disk-size GB  Container disk size in GB (default: 10)")
        (println "  --volume-size GB          Volume size in GB (default: 20)"))
 
@@ -1135,6 +1347,25 @@
        (println)
        (println "Shows available GPU types with pricing information."))
 
+     "start"
+     (do
+       (println "podpilot start <pod-id>")
+       (println)
+       (println "Starts a previously stopped pod.")
+       (println)
+       (println "Arguments:")
+       (println "  pod-id      ID of the pod to start"))
+
+     "stop"
+     (do
+       (println "podpilot stop <pod-id>")
+       (println)
+       (println "Stops a running pod without terminating it.")
+       (println "Note: Storage charges will continue to apply while the pod is stopped.")
+       (println)
+       (println "Arguments:")
+       (println "  pod-id      ID of the pod to stop"))
+
      "kill"
      (do
        (println "podpilot kill <pod-id>")
@@ -1148,13 +1379,14 @@
      "config"
      (do
        (println "podpilot config --api-key YOUR_API_KEY")
-       (println "podpilot config --save-preset NAME [options]")
+       (println "podpilot config --save-preset <preset-name> [--option1 value1 ...]")
        (println "podpilot config --list-presets")
        (println)
        (println "Options:")
        (println "  --api-key KEY             Set your RunPod API key")
-       (println "  --save-preset NAME        Save current options as a preset")
+       (println "  --save-preset             Save options as a preset with name from args")
        (println "  --list-presets            List all saved presets")
+       (println "  --team-id ID              Team ID to use for pod creation")
        (println "  --gpu-type TYPE           GPU type to save in preset")
        (println "  --gpu-count COUNT         GPU count to save in preset")
        (println "  --image IMAGE             Docker image to save in preset")
@@ -1171,6 +1403,15 @@
        (println "  --local PATH       Local file or directory path")
        (println "  --remote PATH      Remote file or directory path on the pod")
        (println "  --direction DIR    Transfer direction: 'to' or 'from' (default: to)"))
+
+     "user"
+     (do
+       (println "podpilot user")
+       (println)
+       (println "Displays information about the current user, including:")
+       (println "  - Basic account details (email, balance, spend rate)")
+       (println "  - Teams the user belongs to and their roles")
+       (println "  - Teams owned by the user and their members"))
 
      ;; Default case - show general help
      (print-help))))
@@ -1212,9 +1453,15 @@
         "shell" (cmd-shell {:opts (cli/parse-opts remaining-args) :args remaining-args})
         "list" (cmd-list {:opts (cli/parse-opts remaining-args) :args remaining-args})
         "catalog" (cmd-catalog {:opts (cli/parse-opts remaining-args) :args remaining-args})
+        "start" (cmd-start {:opts (cli/parse-opts remaining-args) :args remaining-args})
+        "stop" (cmd-stop {:opts (cli/parse-opts remaining-args) :args remaining-args})
         "kill" (cmd-kill {:opts (cli/parse-opts remaining-args) :args remaining-args})
-        "config" (cmd-config {:opts (cli/parse-opts remaining-args) :args remaining-args})
+        "config"
+        (let [opts (cli/parse-opts remaining-args)
+              cmd-args (vec (filter #(not (str/starts-with? % "--")) remaining-args))]
+          (cmd-config {:opts opts :args cmd-args}))
         "transfer" (cmd-transfer {:opts (cli/parse-opts remaining-args) :args remaining-args})
+        "user" (cmd-user {:opts (cli/parse-opts remaining-args) :args remaining-args})
         "help" (if (second args)
                  (print-help (second args))
                  (print-help))

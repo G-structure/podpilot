@@ -55,6 +55,30 @@
 
 (def mock-managed-pods (atom #{"pod123"}))
 
+;; Mock user information
+(def mock-user-info
+  {:id "user123"
+   :email "user@example.com"
+   :clientBalance 120.50
+   :spendLimit 500
+   :currentSpendPerHr 1.25
+   :teams [{:id "team1"
+            :name "Development Team"
+            :owner {:email "owner@example.com"}
+            :membership {:scopes {"role" "admin"}}}
+           {:id "team2"
+            :name "Research Group"
+            :owner {:email "researcher@example.com"}
+            :membership {:scopes {"role" "member"}}}]
+   :ownedTeams [{:id "team3"
+                 :name "My Team"
+                 :members [{:id "member1"
+                            :member {:email "member1@example.com"}
+                            :scopes {"role" "admin"}}
+                           {:id "member2"
+                            :member {:email "member2@example.com"}
+                            :scopes {"role" "member"}}]}]})
+
 ;;; =========================================================================
 ;;; Mock Functions for Testing
 ;;; =========================================================================
@@ -95,6 +119,10 @@
   "Mock implementation of graphql-request function for testing"
   [query variables]
   (cond
+    ;; Query for user information
+    (str/includes? query "myself {")
+    {:data {:myself mock-user-info}}
+
     ;; Query for listing pods
     (str/includes? query "myself {
             pods {")
