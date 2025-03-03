@@ -6,7 +6,7 @@
 ;;; A tool for managing RunPod instances, executing Python code remotely,
 ;;; and automatically handling resources efficiently.
 ;;;
-;;; Author: Open AI Assistant
+;;; Author: Luc Chartier
 ;;; Version: 0.1.0
 ;;; License: MIT
 ;;; =========================================================================
